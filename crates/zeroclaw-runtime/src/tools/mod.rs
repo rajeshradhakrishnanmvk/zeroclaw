@@ -88,6 +88,7 @@ pub use zeroclaw_tools::microsoft365::Microsoft365Tool;
 pub use zeroclaw_tools::model_routing_config::ModelRoutingConfigTool;
 pub use zeroclaw_tools::notion_tool::NotionTool;
 pub use zeroclaw_tools::opencode_cli::OpenCodeCliTool;
+pub use zeroclaw_tools::kubectl::KubectlTool;
 #[cfg(feature = "rag-pdf")]
 pub use zeroclaw_tools::pdf_read::PdfReadTool;
 pub use zeroclaw_tools::pipeline::PipelineTool;
@@ -396,6 +397,14 @@ pub fn all_tools_with_runtime(
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
     ];
+
+    // Kubectl tool (managed by runtime security policy and config)
+    tool_arcs.push(Arc::new(KubectlTool::new(
+        security.clone(),
+        root_config.kubectl_tool.default_kubeconfig.clone().map(std::path::PathBuf::from),
+        root_config.kubectl_tool.default_namespace.clone(),
+        root_config.kubectl_tool.timeout_secs,
+    )));
 
     // Register discord_search if discord_history channel is configured
     if root_config.channels.discord_history.is_some() {

@@ -177,6 +177,12 @@ pub struct SecurityPolicy {
     pub shell_env_passthrough: Vec<String>,
     pub shell_timeout_secs: u64,
     pub tracker: PerSenderTracker,
+    /// Kubectl-specific policy: allowed subcommands (e.g. get, describe)
+    pub kubectl_allowed_subcommands: Vec<String>,
+    /// Optional allowlist of namespaces the agent may operate in. If `None`, all namespaces allowed subject to other checks.
+    pub kubectl_allowed_namespaces: Option<Vec<String>>,
+    /// Whether destructive `delete` operations via kubectl are permitted.
+    pub kubectl_allow_delete: bool,
 }
 
 /// Default allowed commands for Unix platforms.
@@ -310,7 +316,80 @@ impl Default for SecurityPolicy {
             shell_env_passthrough: vec![],
             shell_timeout_secs: 60,
             tracker: PerSenderTracker::new(),
+            kubectl_allowed_subcommands: default_kubectl_allowed_subcommands(),
+            kubectl_allowed_namespaces: None,
+            kubectl_allow_delete: false,
         }
+    }
+}
+
+fn default_kubectl_allowed_subcommands() -> Vec<String> {
+    vec![
+        "get".into(),
+        "describe".into(),
+        "apply".into(),
+        "create".into(),
+        "scale".into(),
+        "rollout".into(),
+        "logs".into(),
+        "port-forward".into(),
+        "exec".into(),
+    ]
+}
+
+impl SecurityPolicy {
+    /// Validate a kubectl invocation at a high level. Returns a risk level or
+    /// an error describing why the invocation is blocked.
+    pub fn validate_kubectl_call(
+        &self,
+        subcommand: &str,
+        _args: &[String],
+        namespace: Option<&str>,
+        approved: bool,
+    ) -> Result<CommandRiskLevel, String> {
+        if self.autonomy == AutonomyLevel::ReadOnly {
+            return Err("autonomy level is read-only".into());
+        }
+
+        let sub = subcommand.to_ascii_lowercase();
+
+        // Check allowed subcommands
+        if !self
+            .kubectl_allowed_subcommands
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(&sub))
+        {
+            return Err(format!("kubectl subcommand '{}' is not allowed by policy", subcommand));
+        }
+
+        // `delete` is treated specially (destructive)
+        if sub == "delete" {
+            if !self.kubectl_allow_delete {
+                return Err("kubectl delete is blocked by policy".into());
+            }
+            // delete is high risk
+            return Ok(CommandRiskLevel::High);
+        }
+
+        // Namespace check
+        if let Some(allowed) = &self.kubectl_allowed_namespaces {
+            if let Some(ns) = namespace {
+                if !allowed.iter().any(|a| a == ns) {
+                    return Err(format!("namespace '{}' is not allowed for kubectl", ns));
+                }
+            }
+        }
+
+        // Heuristic risk assignment
+        let medium_ops = ["apply", "create", "scale", "rollout", "exec", "port-forward"];
+        if medium_ops.iter().any(|&m| m == sub) {
+            if self.autonomy == AutonomyLevel::Supervised && self.require_approval_for_medium_risk && !approved {
+                return Err("kubectl operation requires explicit approval".into());
+            }
+            return Ok(CommandRiskLevel::Medium);
+        }
+
+        Ok(CommandRiskLevel::Low)
     }
 }
 
@@ -1618,6 +1697,9 @@ impl SecurityPolicy {
             shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
             shell_timeout_secs: autonomy_config.shell_timeout_secs,
             tracker: PerSenderTracker::new(),
+            kubectl_allowed_subcommands: default_kubectl_allowed_subcommands(),
+            kubectl_allowed_namespaces: None,
+            kubectl_allow_delete: false,
         }
     }
 

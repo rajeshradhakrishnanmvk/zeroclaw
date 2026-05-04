@@ -461,6 +461,11 @@ pub struct Config {
     #[nested]
     pub shell_tool: ShellToolConfig,
 
+    /// Kubectl tool configuration (`[kubectl_tool]`).
+    #[serde(default)]
+    #[nested]
+    pub kubectl_tool: KubectlToolConfig,
+
     /// Escalation routing configuration (`[escalation]`).
     #[serde(default)]
     #[nested]
@@ -3030,6 +3035,38 @@ impl Default for ShellToolConfig {
     fn default() -> Self {
         Self {
             timeout_secs: default_shell_tool_timeout_secs(),
+        }
+    }
+}
+
+/// Kubectl tool configuration (`[kubectl_tool]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "kubectl-tool"]
+pub struct KubectlToolConfig {
+    /// Default kubeconfig path used when none is provided in a tool call.
+    #[serde(default)]
+    pub default_kubeconfig: Option<String>,
+
+    /// Default namespace to use when none is provided in a tool call.
+    #[serde(default)]
+    pub default_namespace: Option<String>,
+
+    /// Timeout for kubectl executions in seconds.
+    #[serde(default = "default_kubectl_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_kubectl_timeout_secs() -> u64 {
+    60
+}
+
+impl Default for KubectlToolConfig {
+    fn default() -> Self {
+        Self {
+            default_kubeconfig: None,
+            default_namespace: None,
+            timeout_secs: default_kubectl_timeout_secs(),
         }
     }
 }
@@ -9498,6 +9535,7 @@ impl Default for Config {
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            kubectl_tool: KubectlToolConfig::default(),
             escalation: EscalationConfig::default(),
         }
     }
