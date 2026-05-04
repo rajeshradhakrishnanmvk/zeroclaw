@@ -438,9 +438,40 @@ impl Agent {
                 .push(ConversationMessage::Chat(ChatMessage::system(sys)));
         }
         for msg in messages {
-            if msg.role != "system" {
-                self.history.push(ConversationMessage::Chat(msg.clone()));
+            if msg.role == "system" {
+                continue;
             }
+
+            // Restore structured assistant tool-call history from serialized
+            // chat messages so provider-specific fields can round-trip.
+            if msg.role == "assistant" {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content)
+                    && let Some(tool_calls_value) = value.get("tool_calls")
+                    && let Ok(tool_calls) =
+                        serde_json::from_value::<Vec<zeroclaw_providers::ToolCall>>(
+                            tool_calls_value.clone(),
+                        )
+                {
+                    let text = value
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+                    let reasoning_content = value
+                        .get("reasoning_content")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+
+                    self.history
+                        .push(ConversationMessage::AssistantToolCalls {
+                            text,
+                            tool_calls,
+                            reasoning_content,
+                        });
+                    continue;
+                }
+            }
+
+            self.history.push(ConversationMessage::Chat(msg.clone()));
         }
     }
 
@@ -2263,6 +2294,49 @@ mod tests {
             agent.tool_specs.is_empty(),
             "No tools should match a non-existent allowlist entry"
         );
+    }
+
+    #[test]
+    fn seed_history_preserves_reasoning_content_from_tool_calls() {
+        let provider = Box::new(MockProvider {
+            responses: vec![],
+            call_count: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut agent = Agent::new_for_test(provider);
+
+        let assistant_with_reasoning = ChatMessage::assistant(
+            serde_json::json!({
+                "content": "Let me check that",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "name": "shell",
+                    "arguments": "{\"cmd\":\"ls\"}"
+                }],
+                "reasoning_content": "I need to list the files first"
+            })
+            .to_string(),
+        );
+
+        agent.seed_history(&[assistant_with_reasoning]);
+
+        assert_eq!(agent.history.len(), 2); // system + assistant
+        match &agent.history[1] {
+            ConversationMessage::AssistantToolCalls {
+                text,
+                tool_calls,
+                reasoning_content,
+            } => {
+                assert_eq!(text.as_deref(), Some("Let me check that"));
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].name, "shell");
+                assert_eq!(
+                    reasoning_content.as_deref(),
+                    Some("I need to list the files first"),
+                    "reasoning_content should be preserved from session restoration"
+                );
+            }
+            _ => panic!("Expected AssistantToolCalls variant with reasoning_content"),
+        }
     }
 
     #[test]

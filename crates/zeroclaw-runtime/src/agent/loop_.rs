@@ -543,6 +543,15 @@ pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)
 #[derive(Debug, Default)]
 struct StreamedChatOutcome {
     response_text: String,
+    /// Accumulated reasoning/thinking content from streaming deltas.
+    ///
+    /// Captured separately from `response_text` so it can be threaded into
+    /// `ChatResponse.reasoning_content` and ultimately persisted on the
+    /// `AssistantToolCalls` history entry. Required for providers like
+    /// DeepSeek V4 that reject follow-up requests when the assistant's
+    /// prior `reasoning_content` is missing from replayed tool-call turns
+    /// (see issue #6059).
+    reasoning_content: String,
     tool_calls: Vec<ToolCall>,
     forwarded_live_deltas: bool,
 }
@@ -597,6 +606,16 @@ async fn consume_provider_streaming_response(
                 // do not affect the agent's tool dispatch loop.
             }
             StreamEvent::TextDelta(chunk) => {
+                // Reasoning/thinking deltas arrive on the same `TextDelta`
+                // event as plain text but populate `chunk.reasoning` instead
+                // of `chunk.delta`. They must be captured into the outcome
+                // even when `chunk.delta` is empty so providers that require
+                // reasoning to round-trip on follow-up turns can replay it.
+                if let Some(reasoning) = chunk.reasoning.as_deref()
+                    && !reasoning.is_empty()
+                {
+                    outcome.reasoning_content.push_str(reasoning);
+                }
                 if chunk.delta.is_empty() {
                     continue;
                 }
@@ -1124,7 +1143,8 @@ pub async fn run_tool_call_loop(
                         text: Some(streamed.response_text),
                         tool_calls: streamed.tool_calls,
                         usage: None,
-                        reasoning_content: None,
+                        reasoning_content: (!streamed.reasoning_content.is_empty())
+                            .then_some(streamed.reasoning_content),
                     })
                 }
                 Err(stream_err) => {
@@ -4140,6 +4160,10 @@ mod tests {
 
     enum NativeStreamTurn {
         ToolCall(ToolCall),
+        ReasoningThenToolCall {
+            reasoning: String,
+            tool_call: ToolCall,
+        },
         Text(String),
     }
 
@@ -4232,6 +4256,14 @@ mod tests {
                         Ok(StreamEvent::Final),
                     ]))
                 }
+                NativeStreamTurn::ReasoningThenToolCall {
+                    reasoning,
+                    tool_call,
+                } => Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::reasoning(reasoning))),
+                    Ok(StreamEvent::ToolCall(tool_call)),
+                    Ok(StreamEvent::Final),
+                ])),
                 NativeStreamTurn::Text(text) => Box::pin(futures_util::stream::iter(vec![
                     Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
                     Ok(StreamEvent::Final),
@@ -6044,6 +6076,89 @@ mod tests {
         assert_eq!(provider.stream_tool_requests.load(Ordering::SeqCst), 2);
         assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
         assert_eq!(visible_deltas, "done");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_preserves_streamed_reasoning_for_native_tool_history() {
+        let provider = StreamingNativeToolEventProvider::with_turns(vec![
+            NativeStreamTurn::ReasoningThenToolCall {
+                reasoning: "choose the counting tool".to_string(),
+                tool_call: ToolCall {
+                    id: "call_native_reasoning".to_string(),
+                    name: "count_tool".to_string(),
+                    arguments: r#"{"value":"A"}"#.to_string(),
+                    extra_content: None,
+                },
+            },
+            NativeStreamTurn::Text("done".to_string()),
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run native tools"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            5,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("native streaming reasoning should preserve tool loop semantics");
+
+        while rx.recv().await.is_some() {}
+
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+        let assistant_tool_history = history
+            .iter()
+            .find(|message| {
+                message.role == "assistant"
+                    && serde_json::from_str::<serde_json::Value>(&message.content)
+                        .ok()
+                        .is_some_and(|value| value.get("tool_calls").is_some())
+            })
+            .expect("assistant tool-call history should be persisted");
+        let payload: serde_json::Value = serde_json::from_str(&assistant_tool_history.content)
+            .expect("assistant tool-call history should be JSON");
+        assert_eq!(
+            payload["reasoning_content"].as_str(),
+            Some("choose the counting tool")
+        );
     }
 
     #[tokio::test]
